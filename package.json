@@ -7,6 +7,7 @@
     "dev": "astro dev",
     "build": "astro check && astro build",
     "check": "astro check",
+    "test": "node scripts/test-reconciliation.mjs",
     "preview": "astro preview"
   },
   "dependencies": {
