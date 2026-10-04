@@ -1,4 +1,14 @@
 import "@shoelace-style/shoelace/dist/shoelace.js";
+import {
+  fetchReviewSheet,
+  formatIssueTime,
+  loadReviewSheet,
+  reconcileAll,
+  reconcileBlock,
+  saveReviewSheet,
+  type ReconcileState,
+  type ReviewSheet,
+} from "./review";
 
 type BlockType = "heading" | "paragraph" | "image" | "link";
 type ReviewStatus = "pending" | "approved" | "needs-work";
@@ -22,6 +32,7 @@ interface CommentItem {
 
 interface ContentBlock {
   id: string;
+  paragraphNo: number; // 段落编号，与审校单对账用
   type: BlockType;
   text: string;
   accessibleText: string;
@@ -30,7 +41,8 @@ interface ContentBlock {
   imageAlt?: string;
   linkHref?: string;
   changeReason: string;
-  reviewStatus: ReviewStatus;
+  reviewStatus: ReviewStatus; // 工作台自评；导出的已复核标记只认审校单
+  lastModifiedAt: string; // 内容最后改动时间，用于判定审校结论是否失效
   comments: CommentItem[];
 }
 
@@ -71,10 +83,11 @@ interface AccessibilityIssue {
 }
 
 const STORAGE_KEY = "sologsb-1009-accessible-textbook-v1";
+const SEED_MODIFIED_AT = "2026-09-01T09:00:00.000Z";
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
 function createSeedProject(): ChapterProject {
-  const blocks: ContentBlock[] = [
+  const blocks: Array<Omit<ContentBlock, "paragraphNo" | "lastModifiedAt">> = [
     {
       id: "block-h1",
       type: "heading",
@@ -155,12 +168,18 @@ function createSeedProject(): ChapterProject {
     },
   ];
 
+  const seededBlocks: ContentBlock[] = blocks.map((block, index) => ({
+    ...block,
+    paragraphNo: index + 1,
+    lastModifiedAt: SEED_MODIFIED_AT,
+  }));
+
   return {
     id: "accessible-textbook-1009",
     title: "科学（五年级下册）·无障碍改写稿",
     subject: "科学",
     grade: "五年级",
-    blocks,
+    blocks: seededBlocks,
     glossary: [
       { id: "term-1", source: "水循环", preferred: "水循环", note: "全书统一使用" },
       { id: "term-2", source: "地表径流", preferred: "沿地面流动的水", note: "首次出现时使用通俗解释" },
@@ -201,17 +220,21 @@ function parseImportedChapter(input: string): ContentBlock[] {
     }
     blocks.push(blankBlock("paragraph", line));
   }
-  return blocks.length ? blocks : [blankBlock("paragraph", input.trim() || "请输入章节内容")];
+  const result = blocks.length ? blocks : [blankBlock("paragraph", input.trim() || "请输入章节内容")];
+  const now = new Date().toISOString();
+  return result.map((block, index) => ({ ...block, paragraphNo: index + 1, lastModifiedAt: now }));
 }
 
 function blankBlock(type: BlockType, text: string, extra: Partial<ContentBlock> = {}): ContentBlock {
   return {
     id: uid("block"),
+    paragraphNo: 0, // 由 parseImportedChapter 按顺序分配
     type,
     text,
     accessibleText: type === "image" ? extra.imageAlt ?? "" : text,
     changeReason: "",
     reviewStatus: "pending",
+    lastModifiedAt: new Date().toISOString(),
     comments: [],
     ...extra,
   };
@@ -333,25 +356,59 @@ function statusLabel(status: ReviewStatus) {
   return "待审核";
 }
 
+function rvStateLabel(state: ReconcileState) {
+  if (state === "reviewed") return "已复核";
+  if (state === "rejected") return "退回 · 待改";
+  if (state === "stale") return "待重新确认";
+  return "未复核 · 缺对账";
+}
+
 function severityLabel(severity: Severity) {
   if (severity === "error") return "必须修复";
   if (severity === "warning") return "建议优化";
   return "一致性提醒";
 }
 
-function exportHtml(project: ChapterProject) {
+function reviewBadge(state: ReconcileState): string {
+  const label = state === "reviewed" ? "已复核"
+    : state === "rejected" ? "待改"
+    : state === "stale" ? "待重新确认"
+    : "未复核";
+  const title = state === "reviewed" ? "审校单通过"
+    : state === "rejected" ? "审校单退回，待修改后重新送审"
+    : state === "stale" ? "审校单出具后有改动，结论需重新确认"
+    : "审校单尚无结论，缺对账";
+  return `<span class="rv rv-${state}" title="${title}">${label}</span>`;
+}
+
+function reviewSummaryHtml(project: ChapterProject, sheet: ReviewSheet | null): string {
+  const summary = reconcileAll(project.blocks, sheet);
+  const issueTime = formatIssueTime(sheet?.issueTime ?? null);
+  const pending = summary.missingParagraphs.length
+    ? `<p class="rv-pending">待补清单（段落编号）：段 ${summary.missingParagraphs.join("、")}。审校单暂时缺这些段落的结论，联网后会按段落编号补回，改写稿与批注不受影响。</p>`
+    : `<p class="rv-all">全部段落已按段落编号与审校单对账。</p>`;
+  return `<section class="review-summary" aria-label="审校对账信息">
+    <h2>审校对账信息</h2>
+    <p>审校单出具时间：<time>${issueTime}</time> · 已复核 ${summary.reviewed} · 待改 ${summary.rejected} · 待重新确认 ${summary.stale} · 未复核 ${summary.missing}</p>
+    ${pending}
+  </section>`;
+}
+
+function exportHtml(project: ChapterProject, sheet: ReviewSheet | null) {
   const body = project.blocks.map((block) => {
+    const state = reconcileBlock(block, sheet).state;
+    const badge = reviewBadge(state);
     if (block.type === "heading") {
       const level = Math.min(6, Math.max(1, block.headingLevel ?? 2));
-      return `<h${level}>${escapeHtml(block.accessibleText || block.text)}</h${level}>`;
+      return `<h${level} data-review="${state}">${escapeHtml(block.accessibleText || block.text)} ${badge}</h${level}>`;
     }
     if (block.type === "image") {
-      return `<figure><img src="${escapeHtml(block.imageSrc ?? "")}" alt="${escapeHtml(block.imageAlt || block.accessibleText)}"><figcaption>${escapeHtml(block.text)}</figcaption></figure>`;
+      return `<figure data-review="${state}"><img src="${escapeHtml(block.imageSrc ?? "")}" alt="${escapeHtml(block.imageAlt || block.accessibleText)}"><figcaption>${escapeHtml(block.text)} ${badge}</figcaption></figure>`;
     }
     if (block.type === "link") {
-      return `<p><a href="${escapeHtml(block.linkHref ?? "#")}">${escapeHtml(block.accessibleText || block.text)}</a></p>`;
+      return `<p data-review="${state}"><a href="${escapeHtml(block.linkHref ?? "#")}">${escapeHtml(block.accessibleText || block.text)}</a> ${badge}</p>`;
     }
-    return `<p>${escapeHtml(block.accessibleText || block.text)}</p>`;
+    return `<p data-review="${state}">${escapeHtml(block.accessibleText || block.text)} ${badge}</p>`;
   }).join("\n      ");
   return `<!doctype html>
 <html lang="zh-CN">
@@ -367,11 +424,22 @@ function exportHtml(project: ChapterProject) {
     h1, h2, h3, h4, h5, h6 { line-height: 1.4; margin-top: 1.8em; }
     figure { margin: 2em 0; } img { max-width: 100%; height: auto; } figcaption { font-size: .86em; color: #46554f; }
     .skip { position: absolute; left: -9999px; } .skip:focus { position: static; display: inline-block; padding: .5em; background: #fff; }
+    .rv { display: inline-block; margin-left: .4em; padding: .05em .5em; border-radius: 99px; font-size: .62em; font-weight: 700; vertical-align: middle; white-space: nowrap; }
+    .rv-reviewed { color: #1d6b48; background: #e2f3eb; border: 1px solid #bfe2d2; }
+    .rv-rejected { color: #98261f; background: #fbe9e7; border: 1px solid #f0c6c1; }
+    .rv-stale { color: #8a5209; background: #fff0d8; border: 1px solid #ecd3a6; }
+    .rv-missing { color: #5d6a64; background: #eef1ef; border: 1px solid #d3dbd7; }
+    .review-summary { margin: 0 0 2.5em; padding: 16px 18px; border: 1px solid #d7ddd9; border-radius: 12px; background: #f6f8f6; font-size: .78em; line-height: 1.7; }
+    .review-summary h2 { margin: 0 0 .4em; font-size: 1.15em; }
+    .review-summary p { margin: .3em 0; }
+    .review-summary .rv-pending { color: #8a5209; }
+    .review-summary .rv-all { color: #2c7255; }
   </style>
 </head>
 <body>
   <a class="skip" href="#main">跳到正文</a>
   <main id="main" tabindex="-1">
+    ${reviewSummaryHtml(project, sheet)}
       ${body}
   </main>
 </body>
@@ -388,14 +456,23 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
+function normalizeProject(project: ChapterProject): ChapterProject {
+  const fallbackTime = project.updatedAt || SEED_MODIFIED_AT;
+  project.blocks.forEach((block, index) => {
+    if (!block.paragraphNo || block.paragraphNo < 1) block.paragraphNo = index + 1;
+    if (!block.lastModifiedAt) block.lastModifiedAt = fallbackTime;
+  });
+  return project;
+}
+
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) return normalizeProject(stored.project);
   } catch {
     // Fall back to the bundled sample.
   }
-  return createSeedProject();
+  return normalizeProject(createSeedProject());
 }
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
@@ -411,15 +488,61 @@ let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
+let reviewSheet: ReviewSheet | null = loadReviewSheet();
+let reviewFetching = false;
+let reviewNotice = ""; // 最近一次对账提示（如待补清单、离线说明）
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
+const reviewSummary = () => reconcileAll(project.blocks, reviewSheet);
+const activeReviewState = () => reconcileBlock(activeBlock(), reviewSheet);
 
 function saveSoon() {
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
   }, 320);
+}
+
+function reviewBlocksPayload() {
+  return project.blocks.map((block) => ({
+    paragraphNo: block.paragraphNo,
+    type: block.type,
+    text: block.text,
+    accessibleText: block.accessibleText,
+    imageAlt: block.imageAlt,
+    headingLevel: block.headingLevel,
+  }));
+}
+
+// 向审校室取单；返回后按段落编号合并补回，只动审校单，不改写稿和批注。
+async function requestReviewSheet(mode: "fetch" | "supplement") {
+  if (reviewFetching) return;
+  reviewFetching = true;
+  reviewNotice = mode === "supplement" ? "正在连接审校室补回结论…" : "正在向审校室取审校单…";
+  render();
+  const result = await fetchReviewSheet(reviewBlocksPayload(), { online: navigator.onLine });
+  reviewFetching = false;
+  if (result.ok && result.sheet) {
+    reviewSheet = mergeReviewSheet(reviewSheet, result.sheet);
+    saveReviewSheet(reviewSheet);
+    const summary = reconcileAll(project.blocks, reviewSheet);
+    reviewNotice = summary.missing
+      ? `已按段落编号补回结论，仍有 ${summary.missing} 段缺对账（待补：段 ${summary.missingParagraphs.join("、")}）`
+      : `审校单已出具（${formatIssueTime(reviewSheet.issueTime)}），${summary.reviewed} 段已复核、${summary.rejected} 段待改、${summary.stale} 段需重新确认`;
+  } else {
+    reviewNotice = "当前离线，暂取不到审校单；导出可照常进行，缺对账的段落会进待补清单，联网后自动补回。";
+  }
+  render();
+}
+
+// 按段落编号合并：新结论覆盖旧结论，旧单里有而新单没覆盖的段落保留。
+function mergeReviewSheet(previous: ReviewSheet | null, next: ReviewSheet): ReviewSheet {
+  if (!previous) return next;
+  const byNo = new Map<number, ReviewSheet["items"][number]>();
+  for (const item of previous.items) byNo.set(item.paragraphNo, item);
+  for (const item of next.items) byNo.set(item.paragraphNo, item);
+  return { ...next, items: Array.from(byNo.values()).sort((a, b) => a.paragraphNo - b.paragraphNo) };
 }
 
 function commit(label: string, update: (draft: ChapterProject) => void, renderAfter = true) {
@@ -463,6 +586,8 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
 function render() {
   const list = issues();
   const active = activeBlock();
+  const review = reviewSummary();
+  const activeRv = activeReviewState();
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
@@ -501,10 +626,11 @@ function render() {
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
+              const rvState = review.results.find((r) => r.block.id === block.id)?.state ?? "missing";
               return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
-                <span class="block-order">${index + 1}</span>
+                <span class="block-order">${block.paragraphNo || index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
-                <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
+                <span class="block-flags"><i class="rv-dot rv-dot-${rvState}" title="审校单：${rvStateLabel(rvState)}"></i><i class="status-${block.reviewStatus}" title="工作台自评：${statusLabel(block.reviewStatus)}"></i></span>
                 ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
@@ -516,11 +642,16 @@ function render() {
 
         <main class="editor-panel">
           <div class="editor-head">
-            <div><span class="eyebrow">当前内容块</span><h1>${blockRole(active)}</h1></div>
+            <div><span class="eyebrow">当前内容块 · 段落编号 ${active.paragraphNo}</span><h1>${blockRole(active)}</h1></div>
             <div class="review-actions">
               <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
+          </div>
+
+          <div class="review-verdict rv-verdict-${activeRv.state}">
+            <div class="rv-verdict-head"><span class="rv-dot rv-dot-${activeRv.state}"></span><b>审校单结论：${rvStateLabel(activeRv.state)}</b>${activeRv.decision ? `<sl-badge variant="neutral">段落 ${active.paragraphNo} · ${new Date(activeRv.decision.decidedAt).toLocaleString()}</sl-badge>` : ""}</div>
+            <p>${escapeHtml(activeRv.reason)}。导出的无障碍版本只认审校单结论；工作台自评通过但审校单未给结论的段落，仍记未复核。</p>
           </div>
 
           ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
@@ -560,6 +691,36 @@ function render() {
         </main>
 
         <aside class="review-panel">
+          <section class="review-card">
+            <div class="section-heading">
+              <div><span class="eyebrow">Review sheet</span><h2>审校单</h2></div>
+              <sl-button size="small" variant="primary" outline data-action="fetch-review" ${reviewFetching ? "loading" : ""}>${reviewSheet ? "重新取单" : "取审校单"}</sl-button>
+            </div>
+            ${reviewSheet ? `
+              <div class="sheet-meta"><span>${escapeHtml(reviewSheet.source)}</span><span>出具时间：${formatIssueTime(reviewSheet.issueTime)}</span></div>
+            ` : `<div class="empty-note">${reviewFetching ? "正在连接审校室…" : "尚未取得审校单。导出可照常进行，缺对账段落会进待补清单。"}</div>`}
+            <div class="rv-counts">
+              <span class="rv-chip rv-reviewed">已复核 ${review.reviewed}</span>
+              <span class="rv-chip rv-rejected">待改 ${review.rejected}</span>
+              <span class="rv-chip rv-stale">待重新确认 ${review.stale}</span>
+              <span class="rv-chip rv-missing">未复核 ${review.missing}</span>
+            </div>
+            ${review.missingParagraphs.length ? `
+              <div class="rv-pending-box">
+                <b>待补清单（${review.missingParagraphs.length} 段）</b>
+                <p>段落 ${review.missingParagraphs.map((n) => `<span class="rv-parano">${n}</span>`).join("")} 缺审校结论。联网后点“补回结论”按段落编号补回，改写稿和批注不受影响。</p>
+                <sl-button size="small" variant="primary" data-action="supplement-review" ${reviewFetching ? "loading" : ""}>连接恢复，补回结论</sl-button>
+              </div>
+            ` : ""}
+            ${reviewNotice ? `<div class="rv-notice">${escapeHtml(reviewNotice)}</div>` : ""}
+            <ol class="rv-sheet-list">
+              ${project.blocks.map((block) => {
+                const state = review.results.find((x) => x.block.id === block.id)?.state ?? "missing";
+                return `<li class="${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}"><span class="rv-dot rv-dot-${state}"></span><b>段 ${block.paragraphNo}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span><em class="rv-state-${state}">${rvStateLabel(state)}</em></li>`;
+              }).join("")}
+            </ol>
+          </section>
+
           <section class="preview-card">
             <div class="section-heading"><div><span class="eyebrow">Reader preview</span><h2>阅读预览</h2></div><div class="mode-switch"><button class="${previewMode === "normal" ? "active" : ""}" data-action="preview-normal">普通</button><button class="${previewMode === "assisted" ? "active" : ""}" data-action="preview-assisted">辅助</button></div></div>
             <div class="reader-preview mode-${previewMode}">${renderPreview()}</div>
@@ -568,7 +729,7 @@ function render() {
           <section class="order-card">
             <div class="section-heading"><div><span class="eyebrow">Screen reader order</span><h2>读屏阅读顺序</h2></div><sl-badge>从上到下</sl-badge></div>
             <ol class="reading-order">
-              ${project.blocks.map((block, index) => `<li class="${block.id === active.id ? "active" : ""}"><b>${index + 1}</b><div><strong>${blockRole(block)}</strong><span>${escapeHtml(block.accessibleText || block.text || "（无内容）")}</span></div></li>`).join("")}
+              ${project.blocks.map((block, index) => `<li class="${block.id === active.id ? "active" : ""}"><b>${block.paragraphNo || index + 1}</b><div><strong>${blockRole(block)}</strong><span>${escapeHtml(block.accessibleText || block.text || "（无内容）")}</span></div></li>`).join("")}
             </ol>
           </section>
 
@@ -627,18 +788,19 @@ function renderAccessibleEditor(block: ContentBlock) {
 
 function renderPreview() {
   return project.blocks.map((block, index) => {
+    const no = block.paragraphNo || index + 1;
     const content = escapeHtml(block.accessibleText || block.text);
     if (block.type === "heading") {
       const tag = `h${Math.min(6, Math.max(1, block.headingLevel ?? 2))}`;
-      return `<${tag} class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${index + 1}</span>${content}</${tag}>`;
+      return `<${tag} class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${no}</span>${content}</${tag}>`;
     }
     if (block.type === "image") {
-      return `<figure class="${block.id === activeBlockId ? "active-block" : ""}"><img src="${escapeHtml(block.imageSrc ?? "")}" alt="${escapeHtml(block.imageAlt || block.accessibleText)}"><figcaption><span class="order-marker">${index + 1}</span>${escapeHtml(block.text)}</figcaption></figure>`;
+      return `<figure class="${block.id === activeBlockId ? "active-block" : ""}"><img src="${escapeHtml(block.imageSrc ?? "")}" alt="${escapeHtml(block.imageAlt || block.accessibleText)}"><figcaption><span class="order-marker">${no}</span>${escapeHtml(block.text)}</figcaption></figure>`;
     }
     if (block.type === "link") {
-      return `<p class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${index + 1}</span><a href="${escapeHtml(block.linkHref ?? "#")}" onclick="return false">${content}</a><span class="link-role">链接</span></p>`;
+      return `<p class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${no}</span><a href="${escapeHtml(block.linkHref ?? "#")}" onclick="return false">${content}</a><span class="link-role">链接</span></p>`;
     }
-    return `<p class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${index + 1}</span>${content}</p>`;
+    return `<p class="${block.id === activeBlockId ? "active-block" : ""}"><span class="order-marker">${no}</span>${content}</p>`;
   }).join("");
 }
 
@@ -665,6 +827,7 @@ function wireLiveFields() {
         }
         if (field === "link-href") block.linkHref = value;
         if (field === "reason") block.changeReason = value;
+        if (field !== "reason") block.lastModifiedAt = new Date().toISOString();
         block.reviewStatus = "pending";
       }, "编辑无障碍文本", false);
     });
@@ -699,6 +862,7 @@ app.addEventListener("click", (event) => {
       current.accessibleText = suggestion;
       current.changeReason ||= "拆分长句并替换复杂表达，保留原有知识信息。";
       current.reviewStatus = "pending";
+      current.lastModifiedAt = new Date().toISOString();
     }, "生成易读版本");
   }
   if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
@@ -752,8 +916,14 @@ app.addEventListener("click", (event) => {
   if (action === "approve-all") {
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
   }
+  if (action === "fetch-review") { void requestReviewSheet("fetch"); }
+  if (action === "supplement-review") { void requestReviewSheet("supplement"); }
   if (action === "export") {
-    download(`${project.title}-无障碍版.html`, exportHtml(project));
+    const summary = reconcileAll(project.blocks, reviewSheet);
+    download(`${project.title}-无障碍版.html`, exportHtml(project, reviewSheet));
+    reviewNotice = summary.missing
+      ? `已导出；${summary.missing} 段缺对账（待补：段 ${summary.missingParagraphs.join("、")}），补回前导出稿记未复核。`
+      : "已导出，全部段落已按审校单对账。";
     document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
     render();
   }
@@ -765,7 +935,7 @@ app.addEventListener("sl-change", (event) => {
   if (element.id === "chapter-file") return;
   if (element.id.startsWith("heading-level-")) {
     const level = Number((element as HTMLElement & { value: string }).value);
-    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; }, "修改标题层级");
+    updateActiveBlock((block) => { block.headingLevel = level; block.reviewStatus = "pending"; block.lastModifiedAt = new Date().toISOString(); }, "修改标题层级");
   }
   if (element.id === "version-select") {
     selectedVersionId = (element as HTMLElement & { value: string }).value;
@@ -798,8 +968,15 @@ app.addEventListener("input", (event) => {
   }
 });
 
-window.addEventListener("online", render);
-window.addEventListener("offline", render);
+window.addEventListener("online", () => {
+  render();
+  // 连接恢复后按段落编号补回审校结论；改写稿和批注不受影响。
+  if (reconcileAll(project.blocks, reviewSheet).missing) void requestReviewSheet("supplement");
+});
+window.addEventListener("offline", () => {
+  reviewNotice = "已离线：仍可继续编辑和导出，缺对账段落进待补清单，联网后自动补回。";
+  render();
+});
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement;
   if (target.matches("input, textarea, sl-input, sl-textarea, [contenteditable='true']")) return;
